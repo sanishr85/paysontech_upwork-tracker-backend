@@ -1,0 +1,20 @@
+{
+  "name": "upwork-tracker-proxy",
+  "version": "1.0.0",
+  "description": "Proxy server for Upwork RSS feeds",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["upwork", "rss", "proxy"],
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "node-fetch": "^2.7.0",
+    "xml2js": "^0.6.2"
+  }
+}

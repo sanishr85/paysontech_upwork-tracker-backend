@@ -1,0 +1,16 @@
+# Render.com Build Configuration
+# This file tells Render how to build and run your app
+
+services:
+  - type: web
+    name: upwork-tracker-proxy
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        sync: false  # You'll set this after deploying frontend
