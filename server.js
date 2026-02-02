@@ -1,267 +1,179 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const xml2js = require('xml2js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Simple in-memory cache (5 minute TTL)
+// Apify API configuration - TOKEN MUST BE SET IN ENVIRONMENT VARIABLES
+const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
+const APIFY_ACTOR_ID = 'raEfLcfFWJDO0vtIV';
+
+if (!APIFY_API_TOKEN) {
+  console.warn('WARNING: APIFY_API_TOKEN not set in environment variables!');
+}
+
+// Simple in-memory cache (10 minute TTL)
 const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL = 10 * 60 * 1000;
 
-// CORS configuration - allow your frontend domains
-const allowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:5173',
-  process.env.FRONTEND_URL, // Set this in Render environment variables
-].filter(Boolean);
-
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    
-    // Check if origin is allowed or matches pattern
-    if (allowedOrigins.includes(origin) || 
-        origin.includes('vercel.app') || 
-        origin.includes('netlify.app') ||
-        origin.includes('github.io')) {
-      return callback(null, true);
-    }
-    
-    callback(null, true); // Allow all for now - tighten in production if needed
-  },
-  credentials: true
-}));
-
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-// Cache helper functions
 function getCached(key) {
   const item = cache.get(key);
   if (!item) return null;
-  if (Date.now() > item.expiry) {
-    cache.delete(key);
-    return null;
-  }
+  if (Date.now() > item.expiry) { cache.delete(key); return null; }
   return item.data;
 }
 
 function setCache(key, data) {
-  cache.set(key, {
-    data,
-    expiry: Date.now() + CACHE_TTL
-  });
+  cache.set(key, { data, expiry: Date.now() + CACHE_TTL });
 }
 
-// Health check / root endpoint
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
-    message: 'Upwork RSS Proxy Server',
-    version: '1.0.0',
-    endpoints: {
-      'GET /': 'Health check',
-      'GET /api/upwork/search?keyword=<keyword>': 'Search by keyword',
-      'GET /api/upwork/category?category=<category>': 'Search by category',
-      'POST /api/upwork/batch': 'Batch search multiple keywords'
-    },
-    cacheStatus: `${cache.size} items cached`
+    message: 'Upwork Tracker Proxy Server (Apify)',
+    version: '2.0.0',
+    dataSource: 'Apify Upwork Scraper',
+    tokenConfigured: !!APIFY_API_TOKEN
   });
 });
 
-// Search Upwork by keyword
-app.get('/api/upwork/search', async (req, res) => {
-  const { keyword } = req.query;
-  
-  if (!keyword) {
-    return res.status(400).json({ error: 'Keyword parameter is required' });
+async function runApifyActor(input) {
+  if (!APIFY_API_TOKEN) {
+    throw new Error('APIFY_API_TOKEN not configured');
   }
+  
+  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR_ID}/runs?token=${APIFY_API_TOKEN}`;
+  
+  const runResponse = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input)
+  });
+  
+  if (!runResponse.ok) throw new Error(`Apify API error: ${runResponse.status}`);
+  
+  const runData = await runResponse.json();
+  const runId = runData.data.id;
+  
+  let attempts = 0;
+  while (attempts < 30) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    const statusResponse = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_API_TOKEN}`);
+    const statusData = await statusResponse.json();
+    
+    if (statusData.data.status === 'SUCCEEDED') {
+      const datasetId = statusData.data.defaultDatasetId;
+      const itemsResponse = await fetch(`https://api.apify.com/v2/datasets/${datasetId}/items?token=${APIFY_API_TOKEN}`);
+      return await itemsResponse.json();
+    } else if (statusData.data.status === 'FAILED' || statusData.data.status === 'ABORTED') {
+      throw new Error(`Apify run ${statusData.data.status}`);
+    }
+    attempts++;
+  }
+  throw new Error('Apify run timed out');
+}
+
+app.get('/api/upwork/search', async (req, res) => {
+  const { keyword, limit = 30 } = req.query;
+  if (!keyword) return res.status(400).json({ error: 'Keyword required' });
   
   const cacheKey = `search:${keyword.toLowerCase()}`;
   const cached = getCached(cacheKey);
-  
-  if (cached) {
-    console.log(`Cache hit for: ${keyword}`);
-    return res.json({ ...cached, cached: true });
-  }
-  
-  const url = `https://www.upwork.com/ab/feed/jobs/rss?q=${encodeURIComponent(keyword)}&sort=recency`;
+  if (cached) return res.json({ ...cached, cached: true });
   
   try {
+    const today = new Date();
+    const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    
+    const input = {
+      limit: parseInt(limit),
+      fromDate: weekAgo.toISOString().split('T')[0],
+      toDate: today.toISOString().split('T')[0],
+      'includeKeywords.keywords': [keyword],
+      'includeKeywords.matchTitle': true,
+      'includeKeywords.matchDescription': true
+    };
+    
     console.log(`Fetching: ${keyword}`);
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; UpworkTracker/1.0)'
-      }
-    });
+    const jobs = await runApifyActor(input);
     
-    if (!response.ok) {
-      throw new Error(`Upwork returned status ${response.status}`);
-    }
-    
-    const xmlText = await response.text();
-    
-    const parser = new xml2js.Parser();
-    parser.parseString(xmlText, (err, result) => {
-      if (err) {
-        console.error('XML parsing error:', err);
-        return res.status(500).json({ error: 'Failed to parse RSS feed' });
-      }
-      
-      const responseData = {
-        success: true,
-        keyword: keyword,
-        data: result,
-        timestamp: new Date().toISOString()
-      };
-      
-      setCache(cacheKey, responseData);
-      res.json(responseData);
-    });
-    
+    const responseData = { success: true, keyword, count: jobs.length, jobs, timestamp: new Date().toISOString() };
+    setCache(cacheKey, responseData);
+    res.json(responseData);
   } catch (error) {
-    console.error('Error fetching from Upwork:', error.message);
-    res.status(500).json({ 
-      error: error.message,
-      url: url
-    });
-  }
-});
-
-// Search Upwork by category
-app.get('/api/upwork/category', async (req, res) => {
-  const { category } = req.query;
-  
-  if (!category) {
-    return res.status(400).json({ error: 'Category parameter is required' });
-  }
-  
-  const cacheKey = `category:${category.toLowerCase()}`;
-  const cached = getCached(cacheKey);
-  
-  if (cached) {
-    return res.json({ ...cached, cached: true });
-  }
-  
-  const url = `https://www.upwork.com/ab/feed/jobs/rss?category2=${encodeURIComponent(category)}&sort=recency`;
-  
-  try {
-    console.log(`Fetching category: ${category}`);
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; UpworkTracker/1.0)'
-      }
-    });
-    
-    if (!response.ok) {
-      throw new Error(`Upwork returned status ${response.status}`);
-    }
-    
-    const xmlText = await response.text();
-    
-    const parser = new xml2js.Parser();
-    parser.parseString(xmlText, (err, result) => {
-      if (err) {
-        console.error('XML parsing error:', err);
-        return res.status(500).json({ error: 'Failed to parse RSS feed' });
-      }
-      
-      const responseData = {
-        success: true,
-        category: category,
-        data: result,
-        timestamp: new Date().toISOString()
-      };
-      
-      setCache(cacheKey, responseData);
-      res.json(responseData);
-    });
-    
-  } catch (error) {
-    console.error('Error fetching from Upwork:', error.message);
-    res.status(500).json({ 
-      error: error.message,
-      url: url
-    });
-  }
-});
-
-// Batch search with multiple keywords
-app.post('/api/upwork/batch', async (req, res) => {
-  const { keywords } = req.body;
-  
-  if (!keywords || !Array.isArray(keywords)) {
-    return res.status(400).json({ error: 'Keywords array is required' });
-  }
-  
-  try {
-    const results = await Promise.all(
-      keywords.slice(0, 10).map(async (keyword) => {
-        const cacheKey = `search:${keyword.toLowerCase()}`;
-        const cached = getCached(cacheKey);
-        
-        if (cached) {
-          return { keyword, data: cached.data, cached: true };
-        }
-        
-        const url = `https://www.upwork.com/ab/feed/jobs/rss?q=${encodeURIComponent(keyword)}&sort=recency`;
-        
-        try {
-          const response = await fetch(url, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (compatible; UpworkTracker/1.0)'
-            }
-          });
-          const xmlText = await response.text();
-          
-          return new Promise((resolve) => {
-            const parser = new xml2js.Parser();
-            parser.parseString(xmlText, (err, result) => {
-              if (err) {
-                resolve({ keyword, error: err.message });
-              } else {
-                setCache(cacheKey, { data: result });
-                resolve({ keyword, data: result });
-              }
-            });
-          });
-        } catch (error) {
-          return { keyword, error: error.message };
-        }
-      })
-    );
-    
-    res.json({
-      success: true,
-      results: results,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    console.error('Batch fetch error:', error.message);
+    console.error('Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Clear cache endpoint (optional, for admin use)
-app.post('/api/cache/clear', (req, res) => {
-  cache.clear();
-  res.json({ success: true, message: 'Cache cleared' });
+app.post('/api/upwork/batch', async (req, res) => {
+  const { keywords, limit = 100 } = req.body;
+  if (!keywords || !Array.isArray(keywords)) return res.status(400).json({ error: 'Keywords array required' });
+  
+  const cacheKey = `batch:${keywords.sort().join(',')}`;
+  const cached = getCached(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+  
+  try {
+    const today = new Date();
+    const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    
+    const input = {
+      limit: parseInt(limit),
+      fromDate: weekAgo.toISOString().split('T')[0],
+      toDate: today.toISOString().split('T')[0],
+      'includeKeywords.keywords': keywords.slice(0, 10),
+      'includeKeywords.matchTitle': true,
+      'includeKeywords.matchDescription': true,
+      'includeKeywords.matchSkills': true
+    };
+    
+    console.log(`Batch fetch: ${keywords.join(', ')}`);
+    const jobs = await runApifyActor(input);
+    
+    const responseData = { success: true, keywords, count: jobs.length, jobs, timestamp: new Date().toISOString() };
+    setCache(cacheKey, responseData);
+    res.json(responseData);
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// Start the server
+app.get('/api/upwork/category', async (req, res) => {
+  const { category, limit = 50 } = req.query;
+  if (!category) return res.status(400).json({ error: 'Category required' });
+  
+  const cacheKey = `category:${category}`;
+  const cached = getCached(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+  
+  try {
+    const today = new Date();
+    const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    
+    const input = {
+      limit: parseInt(limit),
+      fromDate: weekAgo.toISOString().split('T')[0],
+      toDate: today.toISOString().split('T')[0],
+      jobCategories: [category]
+    };
+    
+    const jobs = await runApifyActor(input);
+    const responseData = { success: true, category, count: jobs.length, jobs, timestamp: new Date().toISOString() };
+    setCache(cacheKey, responseData);
+    res.json(responseData);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════════╗
-║   Upwork RSS Proxy Server v1.0.0                 ║
-║   Running on port ${PORT}                           ║
-╚══════════════════════════════════════════════════╝
-
-Environment: ${process.env.NODE_ENV || 'development'}
-Frontend URL: ${process.env.FRONTEND_URL || 'Not configured'}
-
-Ready to accept requests...
-  `);
+  console.log(`Upwork Tracker Proxy v2.0.0 running on port ${PORT}`);
+  console.log(`Apify Token: ${APIFY_API_TOKEN ? 'Configured' : 'NOT SET - Add APIFY_API_TOKEN env var!'}`);
 });
